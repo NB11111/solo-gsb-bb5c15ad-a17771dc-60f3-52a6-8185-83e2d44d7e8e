@@ -34,6 +34,11 @@ class HeartbeatIn(BaseModel):
 
 
 class CompleteIn(BaseModel):
+    completion_id: str = Field(
+        ...,
+        min_length=1,
+        description="客户端生成的幂等键；同 task_id + completion_id 的等价回报只生效一次",
+    )
     lease_token: str
     success: bool
     result: Any = None

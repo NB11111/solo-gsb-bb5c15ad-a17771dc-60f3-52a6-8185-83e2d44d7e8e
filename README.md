@@ -18,6 +18,12 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   被重新领取只增加 `attempt`，不影响失败计数。失败后回到 `pending` 等待下一次领取；
   `failure_count` 达到上限后置为 `failed`，并递归阻塞所有直接/间接后继
   （状态 `blocked`，带 `blocked_reason`），后继永远无法被领取。
+- **幂等回报**：回报接口必须携带客户端生成的 `completion_id`。相同
+  `task_id + completion_id` 且 `lease_token`、`success`、`result`、`error`
+  等价的请求只生效一次——即使任务此后已被重新领取，重放也逐字节返回首次响应
+  （同样的 HTTP 状态码与响应体），不会再次递增 `failure_count` 或重复阻塞后继；
+  相同键但内容不同返回 `409 idempotency_conflict`；不同键仍执行当前租约校验。
+  JSON 对象键序不同不影响等价判定。幂等记录持久化在 SQLite 中，服务重启后仍有效。
 - **剩余额度**：状态响应中的 `retries_remaining = max(0, max_retries - failure_count)`，
   与显式失败计数一致，不因租约过期重领而减少。
 - **状态接口**：DAG 概览给出各状态计数；任务详情列出每次尝试的状态、租约令牌、
@@ -114,19 +120,34 @@ curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/heartbeat \
 
 ### 4. 回报结果
 
+回报必须携带客户端生成的幂等键 `completion_id`（建议用 UUID 等全局唯一值）：
+
 ```bash
 # 成功
 curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/complete \
   -H 'Content-Type: application/json' \
-  -d '{"lease_token": "f1a3…", "success": true, "result": {"rows": 42}}'
+  -d '{"completion_id": "3f1c…", "lease_token": "f1a3…", "success": true, "result": {"rows": 42}}'
 
 # 失败（仍有重试额度时回到 pending；额度耗尽则 failed 并阻塞后继）
 curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/complete \
   -H 'Content-Type: application/json' \
-  -d '{"lease_token": "…", "success": false, "error": "connection reset"}'
+  -d '{"completion_id": "9b22…", "lease_token": "…", "success": false, "error": "connection reset"}'
 ```
 
-> 租约过期后旧令牌的任何回报都返回 **409**，不会作用于已开始的新尝试。
+幂等语义：
+
+- 同一 `task_id + completion_id` 且 `lease_token`/`success`/`result`/`error`
+  等价的重复请求（网络重试等）直接返回**首次响应**（同状态码、同响应体）；
+  即使任务租约已过期并被其他工作器重新领取，重放也不经过当前租约校验，
+  既不会重复递增 `failure_count`，也不会重复阻塞后继。
+- 相同 `task_id + completion_id` 但上述任一字段不等价 →
+  `409 {"error":{"code":"idempotency_conflict"}}`。`result` 为 JSON 对象时键序
+  不同视为等价（规范化比较）。
+- 不同的 `completion_id` 视为新回报，仍须通过当前租约校验（旧令牌照例 409）。
+- 幂等记录持久化在 `task-data` 卷的 SQLite 中，服务/容器重启后重放仍然有效。
+
+> 租约过期后旧令牌**首次**使用新 `completion_id` 的回报返回 **409**，
+> 不会作用于已开始的新尝试；只有曾成功生效过的幂等键才会回放首次响应。
 
 ### 5. 状态查询
 
@@ -168,7 +189,7 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
 | `GET` | `/tasks/{task_id}` | 任务详情：尝试历史、租约、阻塞原因 |
 | `POST` | `/tasks/{task_id}/heartbeat` | 凭当前租约令牌续租 |
-| `POST` | `/tasks/{task_id}/complete` | 凭当前租约令牌回报成功/失败 |
+| `POST` | `/tasks/{task_id}/complete` | 凭租约令牌 + `completion_id` 幂等回报成功/失败 |
 | `GET` | `/health` | 健康检查 |
 
 ## 任务状态机
@@ -190,4 +211,5 @@ pytest -q
 
 测试覆盖：DAG 校验（缺失依赖/环/重复键）、依赖门控、并发原子领取、
 attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试与耗尽后递归阻塞、
+幂等回报（重放同响应、内容冲突 409、键序等价、重启后持久化）、旧 SQLite 数据迁移、
 状态接口。

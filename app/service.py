@@ -32,6 +32,17 @@ class APIError(Exception):
         self.details = details
 
 
+class ReplayedResponse:
+    """幂等命中：携带首次有效回报保存的 HTTP 状态码与原始响应体。
+
+    路由层必须将其原样回放（同样的状态码、逐字节的响应体），不得重新序列化。
+    """
+
+    def __init__(self, status_code: int, body: str):
+        self.status_code = status_code
+        self.body = body
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -48,6 +59,11 @@ def _parse(value: str | None) -> datetime | None:
 
 def _dumps(value: Any) -> str | None:
     return None if value is None else json.dumps(value, ensure_ascii=False)
+
+
+def _canonical(value: Any) -> str:
+    """规范化 JSON：递归排序对象键，使键序不同但内容相同的请求视为等价。"""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------- DAG 提交
@@ -358,15 +374,42 @@ def _block_descendants(conn, dag_id: str, root_key: str) -> int:
     return count
 
 
-def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
+def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | ReplayedResponse:
+    completion_id = body["completion_id"]
     token = body["lease_token"]
     success = bool(body["success"])
+    result = body.get("result")
     error = body.get("error")
+    # 规范化指纹：JSON 对象键序不影响等价判定
+    fingerprint = _canonical(
+        {"lease_token": token, "success": success, "result": result, "error": error}
+    )
     now = _now()
 
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # 幂等记录必须在同一保留事务内检查：并发同键回报只有一个能成为首次
+            existing = conn.execute(
+                "SELECT * FROM completions WHERE task_id = ? AND completion_id = ?",
+                (task_id, completion_id),
+            ).fetchone()
+            if existing is not None:
+                # 重放优先于当前租约状态：任务之后是否被重新领取都不影响回放
+                conn.execute("ROLLBACK")
+                if existing["fingerprint"] != fingerprint:
+                    raise APIError(
+                        409,
+                        "idempotency_conflict",
+                        "相同 task_id + completion_id 已用于内容不同的回报",
+                        {
+                            "task_id": task_id,
+                            "completion_id": completion_id,
+                        },
+                    )
+                return ReplayedResponse(existing["status_code"], existing["response_body"])
+
+            # 不同键（或首次请求）：执行当前租约校验
             row = _load_for_token(conn, token)
             if row["id"] != task_id:
                 raise APIError(409, "invalid_lease", "租约令牌与任务不匹配或已失效")
@@ -424,26 +467,47 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
                     state = FAILED
                     blocked_count = _block_descendants(conn, row["dag_id"], row["task_key"])
 
+            if success:
+                retries_remaining = 0
+                saved_failure_count = row["failure_count"]
+            else:
+                # 本次失败后还会被调度的额外尝试次数
+                retries_remaining = max(0, row["max_retries"] - failure_count + 1)
+                saved_failure_count = failure_count
+
+            response = {
+                "task_id": task_id,
+                "state": state,
+                "attempt": row["attempt"],
+                "failure_count": saved_failure_count,
+                "retries_remaining": retries_remaining,
+                "blocked_descendants": blocked_count,
+            }
+            # 与状态变更同一事务持久化：保存规范化指纹、HTTP 状态码和响应体
+            conn.execute(
+                """INSERT INTO completions (task_id, completion_id, lease_token, success,
+                       fingerprint, status_code, response_body, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task_id,
+                    completion_id,
+                    token,
+                    1 if success else 0,
+                    fingerprint,
+                    200,
+                    # 与 Starlette JSONResponse 的序列化保持一致，确保重放逐字节相同
+                    json.dumps(response, ensure_ascii=False, separators=(",", ":")),
+                    _iso(now),
+                ),
+            )
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            # 命中冲突分支时事务已回滚；仅在仍有活动事务时回滚
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
 
-    if success:
-        retries_remaining = 0
-        failure_count = row["failure_count"]
-    else:
-        # 本次失败后还会被调度的额外尝试次数
-        retries_remaining = max(0, row["max_retries"] - failure_count + 1)
-
-    return {
-        "task_id": task_id,
-        "state": state,
-        "attempt": row["attempt"],
-        "failure_count": failure_count,
-        "retries_remaining": retries_remaining,
-        "blocked_descendants": blocked_count,
-    }
+    return response
 
 
 # ---------------------------------------------------------------- 状态查询

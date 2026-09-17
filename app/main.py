@@ -8,7 +8,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response, JSONResponse
 
 from . import service
 from .db import init_db
@@ -73,5 +73,13 @@ def heartbeat(task_id: str, body: HeartbeatIn) -> dict:
 
 
 @app.post("/tasks/{task_id}/complete")
-def complete_task(task_id: str, body: CompleteIn) -> dict:
-    return service.complete_task(task_id, body.model_dump())
+def complete_task(task_id: str, body: CompleteIn):
+    result = service.complete_task(task_id, body.model_dump())
+    if isinstance(result, service.ReplayedResponse):
+        # 幂等命中：逐字节回放首次有效回报保存的状态码与响应体
+        return Response(
+            content=result.body,
+            status_code=result.status_code,
+            media_type="application/json",
+        )
+    return result

@@ -94,6 +94,22 @@ def init_db(path: Path | None = None) -> None:
                 error          TEXT
             );
 
+            -- 结果回报的幂等记录：(task_id, completion_id) 唯一标识一次逻辑回报。
+            -- 首次有效回报在租约校验/状态变更的同一事务内写入规范化请求指纹与
+            -- 首次响应（HTTP 状态码 + 原始响应体）；重放即使发生在任务被重新领取
+            -- 之后也只返回存储的响应，不再改动 failure_count 或阻塞后继。
+            CREATE TABLE IF NOT EXISTS completions (
+                task_id        TEXT NOT NULL REFERENCES tasks(id),
+                completion_id  TEXT NOT NULL,
+                lease_token    TEXT NOT NULL,
+                success        INTEGER NOT NULL,
+                fingerprint    TEXT NOT NULL,   -- lease_token/success/result/error 的规范化 JSON
+                status_code    INTEGER NOT NULL,
+                response_body  TEXT NOT NULL,   -- 首次响应的原始 JSON 文本
+                created_at     TEXT NOT NULL,
+                PRIMARY KEY (task_id, completion_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_tasks_dag_state ON tasks(dag_id, state);
             CREATE INDEX IF NOT EXISTS idx_deps_dep ON dependencies(dag_id, dep_key);
             CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, attempt_no);
