@@ -37,6 +37,12 @@ async def api_error_handler(_request: Request, exc: service.APIError) -> JSONRes
     )
 
 
+@app.exception_handler(service.Replay)
+async def replay_handler(_request: Request, exc: service.Replay) -> JSONResponse:
+    """幂等命中：按首次请求落库的状态码与响应体原样返回。"""
+    return JSONResponse(status_code=exc.status_code, content=exc.body)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}

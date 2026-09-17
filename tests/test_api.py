@@ -119,7 +119,8 @@ def test_full_dependency_flow(client):
 
     # 完成 a 后 b、c 同时可领
     assert client.post(f"/tasks/{claimed[0]['task_id']}/complete",
-                       json={"lease_token": token_a, "success": True}).status_code == 200
+                       json={"lease_token": token_a, "success": True,
+                             "completion_id": "c-a"}).status_code == 200
     claimed = client.post("/tasks/claim", json={"dag_id": dag_id, "limit": 10}).json()["claimed"]
     assert {t["task_key"] for t in claimed} == {"b", "c"}
     for t in claimed:
@@ -130,7 +131,8 @@ def test_full_dependency_flow(client):
 
     for t in claimed:
         client.post(f"/tasks/{t['task_id']}/complete",
-                    json={"lease_token": t["lease_token"], "success": True})
+                    json={"lease_token": t["lease_token"], "success": True,
+                          "completion_id": f"c-{t['task_key']}"})
     d = client.post("/tasks/claim", json={"dag_id": dag_id}).json()["claimed"]
     assert len(d) == 1 and d[0]["task_key"] == "d"
 
@@ -164,7 +166,8 @@ def test_old_token_operations_return_409_after_reclaim(client):
 
     # 旧令牌回报结果 → 409，绝不能覆盖新尝试
     r = client.post(f"/tasks/{task_id}/complete",
-                    json={"lease_token": old_token, "success": True})
+                    json={"lease_token": old_token, "success": True,
+                          "completion_id": "c-old"})
     assert r.status_code == 409
 
     status = client.get(f"/tasks/{task_id}").json()
@@ -184,7 +187,8 @@ def test_heartbeat_extends_lease(client):
     # 租约仍有效：不可再领取，且旧令牌仍可回报
     assert client.post("/tasks/claim", json={}).json()["count"] == 0
     r = client.post(f"/tasks/{t['task_id']}/complete",
-                    json={"lease_token": t["lease_token"], "success": True})
+                    json={"lease_token": t["lease_token"], "success": True,
+                          "completion_id": "c-hb"})
     assert r.status_code == 200
 
 
@@ -192,7 +196,8 @@ def test_wrong_token_returns_409(client):
     submit(client, [{"key": "a"}])
     t = client.post("/tasks/claim", json={}).json()["claimed"][0]
     r = client.post(f"/tasks/{t['task_id']}/complete",
-                    json={"lease_token": uuid.uuid4().hex, "success": True})
+                    json={"lease_token": uuid.uuid4().hex, "success": True,
+                          "completion_id": "c-wrong"})
     assert r.status_code == 409
 
 
@@ -202,14 +207,16 @@ def test_retry_then_success(client):
     submit(client, [{"key": "a", "max_retries": 2}])
     t = client.post("/tasks/claim", json={}).json()["claimed"][0]
     r = client.post(f"/tasks/{t['task_id']}/complete",
-                    json={"lease_token": t["lease_token"], "success": False, "error": "boom"})
+                    json={"lease_token": t["lease_token"], "success": False, "error": "boom",
+                          "completion_id": "c-r1"})
     assert r.json()["state"] == "pending"
     assert r.json()["retries_remaining"] == 2
 
     t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
     assert t2["attempt"] == 2
     assert client.post(f"/tasks/{t2['task_id']}/complete",
-                       json={"lease_token": t2["lease_token"], "success": True}).status_code == 200
+                       json={"lease_token": t2["lease_token"], "success": True,
+                             "completion_id": "c-r2"}).status_code == 200
 
 
 def test_exhausted_retries_blocks_descendants(client):
@@ -227,7 +234,8 @@ def test_exhausted_retries_blocks_descendants(client):
         t = client.post("/tasks/claim", json={}).json()["claimed"][0]
         assert t["attempt"] == expected_attempt
         r = client.post(f"/tasks/{t['task_id']}/complete",
-                        json={"lease_token": t["lease_token"], "success": False, "error": "x"})
+                        json={"lease_token": t["lease_token"], "success": False, "error": "x",
+                              "completion_id": f"c-x-{expected_attempt}"})
     assert r.json()["state"] == "failed"
     assert r.json()["blocked_descendants"] == 2
 
@@ -257,12 +265,14 @@ def test_lease_expiry_reclaim_does_not_consume_retry_budget(client):
 
     # 旧令牌回报失败 -> 409，不得计入失败次数
     r = client.post(f"/tasks/{t1['task_id']}/complete",
-                    json={"lease_token": t1["lease_token"], "success": False, "error": "late"})
+                    json={"lease_token": t1["lease_token"], "success": False, "error": "late",
+                          "completion_id": "c-late"})
     assert r.status_code == 409
 
     # 第一次显式失败：仍可重试（回到 pending），attempts 历史保留过期记录
     r = client.post(f"/tasks/{t2['task_id']}/complete",
-                    json={"lease_token": t2["lease_token"], "success": False, "error": "e1"})
+                    json={"lease_token": t2["lease_token"], "success": False, "error": "e1",
+                          "completion_id": "c-e1"})
     assert r.json()["state"] == "pending"
     assert r.json()["failure_count"] == 1
     status = client.get(f"/tasks/{t2['task_id']}").json()
@@ -274,7 +284,8 @@ def test_lease_expiry_reclaim_does_not_consume_retry_budget(client):
     t3 = client.post("/tasks/claim", json={}).json()["claimed"][0]
     assert t3["attempt"] == 3
     r = client.post(f"/tasks/{t3['task_id']}/complete",
-                    json={"lease_token": t3["lease_token"], "success": False, "error": "e2"})
+                    json={"lease_token": t3["lease_token"], "success": False, "error": "e2",
+                          "completion_id": "c-e2"})
     assert r.json()["state"] == "failed"
     assert r.json()["failure_count"] == 2
     assert r.json()["retries_remaining"] == 0
@@ -290,7 +301,8 @@ def test_retries_remaining_tracks_only_explicit_failures(client):
     t = client.post("/tasks/claim", json={}).json()["claimed"][0]
     assert t["attempt"] == 3
     r = client.post(f"/tasks/{t['task_id']}/complete",
-                    json={"lease_token": t["lease_token"], "success": True})
+                    json={"lease_token": t["lease_token"], "success": True,
+                          "completion_id": "c-fin"})
     assert r.json()["state"] == "succeeded"
     assert r.json()["failure_count"] == 0
     status = client.get(f"/tasks/{t['task_id']}").json()
@@ -339,17 +351,154 @@ def test_legacy_sqlite_db_gets_failure_count_default(tmp_path, monkeypatch):
     row = conn.execute(
         "SELECT attempt, failure_count, max_retries FROM tasks WHERE id = 't1'"
     ).fetchone()
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     conn.close()
     assert row == (3, 0, 1)  # 兼容默认值：过期重领不追溯消耗失败预算
+    assert "completion_idempotency" in tables  # 旧库启动时自动补齐幂等表
 
     from app import service
     t = service.claim_tasks(None, None, 1)["claimed"][0]
     assert t["attempt"] == 4
     # 第一次显式失败仍有重试额度
     result = service.complete_task(
-        t["task_id"], {"lease_token": t["lease_token"], "success": False}
+        t["task_id"],
+        {"lease_token": t["lease_token"], "success": False, "completion_id": "c-legacy"},
     )
     assert result["state"] == "pending" and result["failure_count"] == 1
+
+
+# ------------------------------------------------------------- 幂等回报
+
+def test_complete_requires_completion_id(client):
+    submit(client, [{"key": "a"}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = client.post(f"/tasks/{t['task_id']}/complete",
+                    json={"lease_token": t["lease_token"], "success": True})
+    assert r.status_code == 422
+
+
+def test_replay_after_reclaim_returns_first_response(client):
+    submit(client, [{"key": "a", "max_retries": 2}])
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    body = {"lease_token": t1["lease_token"], "success": False,
+            "error": "boom", "completion_id": "c-1"}
+    r1 = client.post(f"/tasks/{t1['task_id']}/complete", json=body)
+    assert r1.status_code == 200
+    first = r1.json()
+    assert first["state"] == "pending" and first["failure_count"] == 1
+
+    # 任务被重领：新 attempt、新令牌，旧令牌已失效
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["attempt"] == 2 and t2["lease_token"] != t1["lease_token"]
+
+    # 相同 completion_id + 等价内容（旧令牌）：原样返回首次响应
+    r2 = client.post(f"/tasks/{t1['task_id']}/complete", json=body)
+    assert r2.status_code == 200
+    assert r2.json() == first
+
+    # 未再次递增 failure_count，也未影响进行中的新尝试
+    status = client.get(f"/tasks/{t1['task_id']}").json()
+    assert status["failure_count"] == 1
+    assert status["state"] == "running" and status["attempt"] == 2
+
+
+def test_replay_success_keeps_task_succeeded(client):
+    submit(client, [{"key": "a"}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    body = {"lease_token": t["lease_token"], "success": True,
+            "result": {"rows": 42}, "completion_id": "c-ok"}
+    r1 = client.post(f"/tasks/{t['task_id']}/complete", json=body)
+    assert r1.status_code == 200
+    r2 = client.post(f"/tasks/{t['task_id']}/complete", json=body)
+    assert r2.status_code == 200
+    assert r2.json() == r1.json()
+    status = client.get(f"/tasks/{t['task_id']}").json()
+    assert status["state"] == "succeeded" and status["failure_count"] == 0
+
+
+def test_replay_json_key_order_is_equivalent(client):
+    submit(client, [{"key": "a"}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r1 = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"lease_token": t["lease_token"], "success": True,
+              "result": {"a": 1, "b": {"x": 1, "y": 2}}, "completion_id": "c-k"},
+    )
+    assert r1.status_code == 200
+    # 对象键序不同（含嵌套）、内容等价 -> 回放而非冲突
+    r2 = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c-k", "success": True,
+              "result": {"b": {"y": 2, "x": 1}, "a": 1},
+              "lease_token": t["lease_token"]},
+    )
+    assert r2.status_code == 200
+    assert r2.json() == r1.json()
+
+
+def test_same_completion_id_different_content_conflicts(client):
+    submit(client, [{"key": "a", "max_retries": 1}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r1 = client.post(f"/tasks/{t['task_id']}/complete",
+                     json={"lease_token": t["lease_token"], "success": False,
+                           "error": "e1", "completion_id": "c-2"})
+    assert r1.status_code == 200
+    # 相同键、不同内容 -> 409 idempotency_conflict
+    r2 = client.post(f"/tasks/{t['task_id']}/complete",
+                     json={"lease_token": t["lease_token"], "success": False,
+                           "error": "different", "completion_id": "c-2"})
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "idempotency_conflict"
+    # 冲突不影响已落库状态
+    status = client.get(f"/tasks/{t['task_id']}").json()
+    assert status["failure_count"] == 1 and status["state"] == "pending"
+
+
+def test_different_completion_id_runs_lease_validation(client):
+    submit(client, [{"key": "a"}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r1 = client.post(f"/tasks/{t['task_id']}/complete",
+                     json={"lease_token": t["lease_token"], "success": True,
+                           "completion_id": "c-3"})
+    assert r1.status_code == 200
+    # 新 completion_id + 已失效令牌 -> 走当前租约校验，409 invalid_lease
+    r2 = client.post(f"/tasks/{t['task_id']}/complete",
+                     json={"lease_token": t["lease_token"], "success": True,
+                           "completion_id": "c-4"})
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "invalid_lease"
+
+
+def test_failed_lease_validation_is_not_persisted(client):
+    submit(client, [{"key": "a", "lease_seconds": 0.2}])
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    time.sleep(0.25)
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    # 旧令牌 + 新 completion_id：租约校验失败，不落库、不污染该键
+    r = client.post(f"/tasks/{t1['task_id']}/complete",
+                    json={"lease_token": t1["lease_token"], "success": True,
+                          "completion_id": "c-5"})
+    assert r.status_code == 409
+    # 同一 completion_id 换有效令牌：作为首次有效请求正常执行
+    r = client.post(f"/tasks/{t1['task_id']}/complete",
+                    json={"lease_token": t2["lease_token"], "success": True,
+                          "completion_id": "c-5"})
+    assert r.status_code == 200
+    assert r.json()["state"] == "succeeded"
+
+
+def test_replay_does_not_reblock_descendants(client):
+    dag = submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    body = {"lease_token": t["lease_token"], "success": False,
+            "error": "fatal", "completion_id": "c-6"}
+    r1 = client.post(f"/tasks/{t['task_id']}/complete", json=body)
+    assert r1.json()["state"] == "failed" and r1.json()["blocked_descendants"] == 1
+    # 回放返回首次响应，不重复阻塞后继
+    r2 = client.post(f"/tasks/{t['task_id']}/complete", json=body)
+    assert r2.status_code == 200 and r2.json() == r1.json()
+    full = client.get(f"/dags/{dag['id']}").json()
+    assert full["states"]["failed"] == 1 and full["states"]["blocked"] == 1
 
 
 # ------------------------------------------------------------- 状态接口

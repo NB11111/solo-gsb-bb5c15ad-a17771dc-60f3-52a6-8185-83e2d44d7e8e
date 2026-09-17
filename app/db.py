@@ -94,6 +94,18 @@ def init_db(path: Path | None = None) -> None:
                 error          TEXT
             );
 
+            -- 幂等回报：首次有效 complete 的规范化请求指纹、HTTP 状态码与响应体。
+            -- CREATE TABLE IF NOT EXISTS 每次启动都执行，旧版数据库启动时自动补齐（迁移）。
+            CREATE TABLE IF NOT EXISTS completion_idempotency (
+                task_id        TEXT NOT NULL REFERENCES tasks(id),
+                completion_id  TEXT NOT NULL,
+                fingerprint    TEXT NOT NULL,   -- lease_token/success/result/error 的规范化 JSON
+                status_code    INTEGER NOT NULL,
+                response_body  TEXT NOT NULL,   -- 首次响应体（JSON 文本）
+                created_at     TEXT NOT NULL,
+                PRIMARY KEY (task_id, completion_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_tasks_dag_state ON tasks(dag_id, state);
             CREATE INDEX IF NOT EXISTS idx_deps_dep ON dependencies(dag_id, dep_key);
             CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, attempt_no);

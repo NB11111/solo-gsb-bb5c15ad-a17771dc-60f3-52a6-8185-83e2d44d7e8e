@@ -34,6 +34,9 @@ class HeartbeatIn(BaseModel):
 
 
 class CompleteIn(BaseModel):
+    completion_id: str = Field(
+        ..., min_length=1, description="幂等键：同一任务的相同 completion_id 只生效一次"
+    )
     lease_token: str
     success: bool
     result: Any = None
